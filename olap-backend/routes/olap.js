@@ -252,4 +252,145 @@ router.get('/products', async (req, res) => {
   }
 });
 
+// Trong routes/olap.js (hoặc olap.js tùy project của bạn)
+router.post('/sales-cube-dice', async (req, res) => {
+  try {
+    const { itemKeys, cityKeys, years, quarters, months, customerTypes } = req.body;
+
+    // Tạo điều kiện động cho WHERE
+    let wheres = [];
+    if (itemKeys?.length)
+      wheres.push(`sf.Item_key IN (${itemKeys.map(Number).join(',')})`);
+    if (cityKeys?.length)
+      wheres.push(`sf.City_key IN (${cityKeys.map(Number).join(',')})`);
+    if (years?.length)
+      wheres.push(`t.Year IN (${years.map(Number).join(',')})`);
+    if (quarters?.length)
+      wheres.push(`t.Quarter IN (${quarters.map(Number).join(',')})`);
+    if (months?.length)
+      wheres.push(`t.Month IN (${months.map(Number).join(',')})`);
+    if (customerTypes?.length)
+      wheres.push(`cd.Type_name IN (${customerTypes.map(v => `'${v}'`).join(',')})`);
+
+    const whereSQL = wheres.length ? `WHERE ${wheres.join(' AND ')}` : '';
+
+    // Lấy các loại khách hàng động
+    const [types] = await db.query(`SELECT DISTINCT Type_name FROM Customer_Dim ORDER BY Type_name`);
+    const typeList = types.map(t => t.Type_name);
+
+    // Truy vấn tổng hợp OLAP (có thể nhóm theo các chiều cần thiết)
+    const [rows] = await db.query(`
+      SELECT
+        c.State AS region,
+        t.Year,
+        t.Quarter,
+        t.Month,
+        cd.Type_name,
+        SUM(sf.Units_sold) AS unit,
+        SUM(sf.Dollars_sold) AS dollar
+      FROM Sales_Fact sf
+      JOIN City_Dim c     ON sf.City_key = c.City_key
+      JOIN Time_Dim t     ON sf.Time_key = t.Time_key
+      JOIN Customer_Dim cd ON sf.Customer_key = cd.Customer_key
+      ${whereSQL}
+      GROUP BY c.State, t.Year, t.Quarter, t.Month, cd.Type_name
+      ORDER BY c.State, t.Year, t.Quarter, t.Month, cd.Type_name
+    `);
+
+    // (Có thể build tree hoặc trả data thẳng theo nhu cầu frontend)
+    res.json({ data: rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Lấy danh sách city
+router.get('/cities', async (req, res) => {
+  try {
+    const [rows] = await db.query('SELECT City_key, City_name FROM City_Dim ORDER BY City_name');
+    res.json({ cities: rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Lấy danh sách loại khách hàng (Type_name)
+router.get('/customer-types', async (req, res) => {
+  try {
+    const [rows] = await db.query('SELECT DISTINCT Type_name FROM Customer_Dim ORDER BY Type_name');
+    const types = rows.map(r => r.Type_name);
+    res.json({ types });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+// Lấy danh sách năm
+router.get('/years', async (req, res) => {
+  try {
+    const [rows] = await db.query('SELECT DISTINCT Year FROM Time_Dim ORDER BY Year');
+    const years = rows.map(r => r.Year);
+    res.json({ years });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// API OLAP mở rộng: Tổng hợp đồng thời theo sản phẩm và khách hàng
+router.post('/sales-cube-product-customer', async (req, res) => {
+  try {
+    const { itemKeys, customerKeys, cityKeys, years, quarters, months } = req.body;
+
+    let wheres = [];
+    if (itemKeys?.length)
+      wheres.push(`sf.Item_key IN (${itemKeys.map(Number).join(',')})`);
+    if (customerKeys?.length)
+      wheres.push(`sf.Customer_key IN (${customerKeys.map(Number).join(',')})`);
+    if (cityKeys?.length)
+      wheres.push(`sf.City_key IN (${cityKeys.map(Number).join(',')})`);
+    if (years?.length)
+      wheres.push(`t.Year IN (${years.map(Number).join(',')})`);
+    if (quarters?.length)
+      wheres.push(`t.Quarter IN (${quarters.map(Number).join(',')})`);
+    if (months?.length)
+      wheres.push(`t.Month IN (${months.map(Number).join(',')})`);
+
+    const whereSQL = wheres.length ? `WHERE ${wheres.join(' AND ')}` : '';
+
+    // Truy vấn OLAP: group by product + customer (+các chiều khác)
+    const [rows] = await db.query(`
+      SELECT
+        p.Item_key,
+        p.Description AS Product,
+        c.Customer_key,
+        c.Customer_name AS Customer,
+        t.Year,
+        t.Quarter,
+        t.Month,
+        SUM(sf.Units_sold) AS UNIT,
+        SUM(sf.Dollars_sold) AS DOLLAR
+      FROM Sales_Fact sf
+      JOIN Product_Dim p ON sf.Item_key = p.Item_key
+      JOIN Customer_Dim c ON sf.Customer_key = c.Customer_key
+      JOIN Time_Dim t ON sf.Time_key = t.Time_key
+      ${whereSQL}
+      GROUP BY p.Item_key, c.Customer_key, t.Year, t.Quarter, t.Month
+      ORDER BY p.Item_key, c.Customer_key, t.Year, t.Quarter, t.Month
+    `);
+
+    res.json({ data: rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+router.get('/customers', async (req, res) => {
+  try {
+    const [rows] = await db.query('SELECT Customer_key, Customer_name FROM Customer_Dim ORDER BY Customer_name');
+    res.json({ customers: rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 module.exports = router;
