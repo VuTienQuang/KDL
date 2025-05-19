@@ -95,150 +95,95 @@ router.get('/stores-cube', async (req, res) => {
 // ========================
 // 2. Sales Cube API
 // ========================
-router.get('/sales-cube', async (req, res) => {
+
+// ===============================
+// API OLAP động cho drilldown, rollup, slice, dice
+// ===============================
+
+router.post('/sales-cube-dice', async (req, res) => {
   try {
-    const itemKey = req.query.item_key;
-    if (!itemKey) return res.status(400).json({ error: 'Missing item_key' });
+    const {
+      itemKeys = [],
+      cityKeys = [],
+      customerTypes = [],
+      customerKeys = [],
+      years = [],
+      quarters = [],
+      months = [],
+    } = req.body;
 
-    // Lấy các loại khách hàng
-    const [types] = await db.query(`SELECT DISTINCT Type_name FROM Customer_Dim ORDER BY Type_name`);
-    const typeList = types.map(t => t.Type_name);
+    // ==> LẤY CHÍNH XÁC CÁC TRƯỜNG FILTER ĐƯỢC CHỌN <==
+    const groupFields = [];
+    const selects = [];
 
-    // Lấy data có Year, Quarter, Month
+    // PRODUCT
+    if (itemKeys && itemKeys.length > 0) {
+      groupFields.push('p.Description');
+      selects.push('p.Description AS PRODUCT');
+    }
+    // CITY
+    if (cityKeys && cityKeys.length > 0) {
+      groupFields.push('c.City_name');
+      selects.push('c.City_name AS CITY');
+    }
+    // CUSTOMERTYPE
+    if (customerTypes && customerTypes.length > 0) {
+      groupFields.push('cd.Type_name');
+      selects.push('cd.Type_name AS CUSTOMERTYPE');
+    }
+    // YEAR
+    if (years && years.length > 0) {
+      groupFields.push('t.Year');
+      selects.push('t.Year AS YEAR');
+    }
+    // QUARTER
+    if (quarters && quarters.length > 0) {
+      groupFields.push('t.Quarter');
+      selects.push('t.Quarter AS QUARTER');
+    }
+    // MONTH
+    if (months && months.length > 0) {
+      groupFields.push('t.Month');
+      selects.push('t.Month AS MONTH');
+    }
+
+    // Luôn có 2 trường đo lường
+    selects.push('SUM(sf.Units_sold) AS UNIT');
+    selects.push('SUM(sf.Dollars_sold) AS DOLLAR');
+
+    // WHERE động
+    const wheres = [];
+    if (itemKeys.length > 0) wheres.push(`sf.Item_key IN (${itemKeys.map(Number).join(',')})`);
+    if (cityKeys.length > 0) wheres.push(`sf.City_key IN (${cityKeys.map(Number).join(',')})`);
+    if (customerTypes.length > 0) wheres.push(`cd.Type_name IN (${customerTypes.map(t => `'${t}'`).join(',')})`);
+    if (customerKeys.length > 0) wheres.push(`sf.Customer_key IN (${customerKeys.map(Number).join(',')})`);
+    if (years.length > 0) wheres.push(`t.Year IN (${years.map(Number).join(',')})`);
+    if (quarters.length > 0) wheres.push(`t.Quarter IN (${quarters.map(Number).join(',')})`);
+    if (months.length > 0) wheres.push(`t.Month IN (${months.map(Number).join(',')})`);
+
+    const whereSQL = wheres.length ? `WHERE ${wheres.join(' AND ')}` : '';
+    const groupBySQL = groupFields.length ? `GROUP BY ${groupFields.join(', ')}` : '';
+    const orderBySQL = groupFields.length ? `ORDER BY ${groupFields.join(', ')}` : '';
+
     const [rows] = await db.query(`
-      SELECT
-        c.State AS region,
-        t.Year,
-        t.Quarter,
-        t.Month,
-        cd.Type_name,
-        SUM(sf.Units_sold) AS unit,
-        SUM(sf.Dollars_sold) AS dollar
+      SELECT ${selects.join(', ')}
       FROM Sales_Fact sf
-      JOIN City_Dim c     ON sf.City_key = c.City_key
-      JOIN Time_Dim t     ON sf.Time_key = t.Time_key
+      JOIN Product_Dim p ON sf.Item_key = p.Item_key
+      JOIN City_Dim c ON sf.City_key = c.City_key
+      JOIN Time_Dim t ON sf.Time_key = t.Time_key
       JOIN Customer_Dim cd ON sf.Customer_key = cd.Customer_key
-      WHERE sf.Item_key = ?
-      GROUP BY c.State, t.Year, t.Quarter, t.Month, cd.Type_name
-      ORDER BY c.State, t.Year, t.Quarter, t.Month, cd.Type_name
-    `, [itemKey]);
+      ${whereSQL}
+      ${groupBySQL}
+      ${orderBySQL}
+    `);
 
-    // Build region > year > quarter > month, key luôn unique ở từng cấp
-    const regionMap = {};
-    rows.forEach(row => {
-      // REGION
-      if (!regionMap[row.region]) regionMap[row.region] = { key: `region-${row.region}`, city: row.region, children: {}, totals: {} };
-      const region = regionMap[row.region];
-
-      // YEAR
-      if (!region.children[row.Year]) region.children[row.Year] = { key: `region-${row.region}-year-${row.Year}`, year: row.Year, children: {}, totals: {} };
-      const year = region.children[row.Year];
-
-      // QUARTER
-      if (!year.children[row.Quarter]) year.children[row.Quarter] = { key: `region-${row.region}-year-${row.Year}-quarter-${row.Quarter}`, quarter: row.Quarter, children: {}, totals: {} };
-      const quarter = year.children[row.Quarter];
-
-      // MONTH
-      if (!quarter.children[row.Month]) quarter.children[row.Month] = { key: `region-${row.region}-year-${row.Year}-quarter-${row.Quarter}-month-${row.Month}`, month: row.Month, customers: {} };
-      const month = quarter.children[row.Month];
-
-      // Đổ dữ liệu cho từng loại khách hàng
-      month.customers[row.Type_name] = {
-        unit: Number(row.unit),
-        dollar: round2(row.dollar)
-      };
-
-      // Cộng dồn totals lên từng cấp
-      [region, year, quarter].forEach(lv => {
-        lv.totals[row.Type_name] = lv.totals[row.Type_name] || { unit: 0, dollar: 0 };
-        lv.totals[row.Type_name].unit += Number(row.unit);
-        lv.totals[row.Type_name].dollar += Number(row.dollar);
-      });
-    });
-
-    // Build tree recursive, children luôn là mảng, key luôn unique
-    function buildTree(level, lvType = 'region') {
-  if (level.customers) {
-    // Leaf: Month node
-    let rowUnit = 0, rowDollar = 0;
-    typeList.forEach(type => {
-      rowUnit += level.customers[type]?.unit || 0;
-      rowDollar += round2(level.customers[type]?.dollar || 0);
-    });
-    return {
-      key: level.key,
-      city: '',   // chỉ leaf mới có month, các cột khác rỗng
-      year: '',
-      quarter: '',
-      month: level.month,
-      ...typeList.reduce((obj, type) => ({
-        ...obj,
-        [type + '_UNIT']: level.customers[type]?.unit || 0,
-        [type + '_DOLLAR']: round2(level.customers[type]?.dollar || 0)
-      }), {}),
-      total_unit: rowUnit,
-      total_dollar: round2(rowDollar)
-    };
-  }
-
-  // Build children
-  const children = Object.values(level.children).map(child => {
-    // Cấp dưới của region là year
-    if ('year' in child) return buildTree(child, 'year');
-    if ('quarter' in child) return buildTree(child, 'quarter');
-    if ('month' in child) return buildTree(child, 'month');
-    // fallback
-    return buildTree(child, '');
-  });
-
-  // Set cột chỉ cho đúng cấp
-  let row = {
-    key: level.key,
-    city: lvType === 'region' ? level.city : '',
-    year: lvType === 'year' ? level.year : '',
-    quarter: lvType === 'quarter' ? level.quarter : '',
-    month: '', // không điền ở node cha
-    ...typeList.reduce((obj, type) => ({
-      ...obj,
-      [type + '_UNIT']: level.totals[type]?.unit || 0,
-      [type + '_DOLLAR']: round2(level.totals[type]?.dollar || 0)
-    }), {}),
-    total_unit: children.reduce((s, c) => s + (c.total_unit || 0), 0),
-    total_dollar: round2(children.reduce((s, c) => s + (c.total_dollar || 0), 0)),
-    children: children.length ? children : undefined
-  };
-
-  return row;
-}
-
-
-   const data = Object.values(regionMap).map(region => buildTree(region, 'region'));
-
-
-    // Columns
-    const columns = [
-      { title: 'CITY', dataIndex: 'city', key: 'city', width: 140 },
-      { title: 'YEAR', dataIndex: 'year', key: 'year', width: 80 },
-      { title: 'QUARTER', dataIndex: 'quarter', key: 'quarter', width: 80 },
-      { title: 'MONTH', dataIndex: 'month', key: 'month', width: 80 },
-      ...typeList.flatMap(type => [
-        { title: type, children: [
-            { title: 'UNIT', dataIndex: type + '_UNIT', key: type + '_UNIT', align: 'right' },
-            { title: 'DOLLAR', dataIndex: type + '_DOLLAR', key: type + '_DOLLAR', align: 'right' }
-        ]}
-      ]),
-      { title: 'Total', children: [
-          { title: 'UNIT', dataIndex: 'total_unit', key: 'total_unit', align: 'right' },
-          { title: 'DOLLAR', dataIndex: 'total_dollar', key: 'total_dollar', align: 'right' }
-      ]}
-    ];
-
-    res.json({ columns, data });
+    res.json({ data: rows });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });
   }
 });
+
 
 // ========================
 // 3. Products API for Dropdown
@@ -253,57 +198,7 @@ router.get('/products', async (req, res) => {
 });
 
 // Trong routes/olap.js (hoặc olap.js tùy project của bạn)
-router.post('/sales-cube-dice', async (req, res) => {
-  try {
-    const { itemKeys, cityKeys, years, quarters, months, customerTypes } = req.body;
 
-    // Tạo điều kiện động cho WHERE
-    let wheres = [];
-    if (itemKeys?.length)
-      wheres.push(`sf.Item_key IN (${itemKeys.map(Number).join(',')})`);
-    if (cityKeys?.length)
-      wheres.push(`sf.City_key IN (${cityKeys.map(Number).join(',')})`);
-    if (years?.length)
-      wheres.push(`t.Year IN (${years.map(Number).join(',')})`);
-    if (quarters?.length)
-      wheres.push(`t.Quarter IN (${quarters.map(Number).join(',')})`);
-    if (months?.length)
-      wheres.push(`t.Month IN (${months.map(Number).join(',')})`);
-    if (customerTypes?.length)
-      wheres.push(`cd.Type_name IN (${customerTypes.map(v => `'${v}'`).join(',')})`);
-
-    const whereSQL = wheres.length ? `WHERE ${wheres.join(' AND ')}` : '';
-
-    // Lấy các loại khách hàng động
-    const [types] = await db.query(`SELECT DISTINCT Type_name FROM Customer_Dim ORDER BY Type_name`);
-    const typeList = types.map(t => t.Type_name);
-
-    // Truy vấn tổng hợp OLAP (có thể nhóm theo các chiều cần thiết)
-    const [rows] = await db.query(`
-      SELECT
-        c.State AS region,
-        t.Year,
-        t.Quarter,
-        t.Month,
-        cd.Type_name,
-        SUM(sf.Units_sold) AS unit,
-        SUM(sf.Dollars_sold) AS dollar
-      FROM Sales_Fact sf
-      JOIN City_Dim c     ON sf.City_key = c.City_key
-      JOIN Time_Dim t     ON sf.Time_key = t.Time_key
-      JOIN Customer_Dim cd ON sf.Customer_key = cd.Customer_key
-      ${whereSQL}
-      GROUP BY c.State, t.Year, t.Quarter, t.Month, cd.Type_name
-      ORDER BY c.State, t.Year, t.Quarter, t.Month, cd.Type_name
-    `);
-
-    // (Có thể build tree hoặc trả data thẳng theo nhu cầu frontend)
-    res.json({ data: rows });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message });
-  }
-});
 
 // Lấy danh sách city
 router.get('/cities', async (req, res) => {
